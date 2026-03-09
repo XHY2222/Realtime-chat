@@ -18,3 +18,5 @@ ntplib
 schedule
 pyarmor
 zhipuai
+agentscope
+dashscope

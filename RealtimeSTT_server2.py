@@ -14,6 +14,8 @@ from zhipuai import ZhipuAI
 from utils.config import Config
 from utils.common import Common
 from utils.logger import Configure_logger
+from utils.xinsong_rag import XinsongRAG
+from utils.xinsong_react_agent import XinsongReactAgent
 
 from utils.search_online import SEARCH_ONLINE
 from utils.audio_player import AUDIO_PLAYER
@@ -80,6 +82,8 @@ my_logger.info("配置加载完毕")
 
 search_online = SEARCH_ONLINE()
 audio_player =  AUDIO_PLAYER(config.get("audio_player"))
+xinsong_rag_engine = None
+xinsong_react_agent = None
 
 
 def load_bailian_api_key(key_file="/root/apikey.txt"):
@@ -88,6 +92,138 @@ def load_bailian_api_key(key_file="/root/apikey.txt"):
             return f.read().strip()
     except Exception:
         return ""
+
+
+def resolve_openai_credentials():
+    openai_api_base = config.get("openai", "api")
+    openai_api_key = config.get("openai", "api_key")
+    if isinstance(openai_api_key, list):
+        openai_api_key = openai_api_key[0] if openai_api_key else ""
+    if not openai_api_key or openai_api_key == "sk-":
+        openai_api_key = load_bailian_api_key()
+    return openai_api_base, openai_api_key
+
+
+def get_xinsong_rag_config():
+    cfg = config.get("xinsong_rag") or {}
+    default_kb_path = os.path.join(file_relative_path, "data", "新松机器人Agent语料库.md")
+    kb_path = cfg.get("kb_path", default_kb_path)
+    if isinstance(kb_path, str) and kb_path and not os.path.isabs(kb_path):
+        kb_path = os.path.join(file_relative_path, kb_path)
+    return {
+        "enable": cfg.get("enable", True),
+        "trigger_keywords": cfg.get("trigger_keywords", ["新松"]),
+        "kb_path": kb_path,
+        "top_k": cfg.get("top_k", 4),
+        "chunk_size": cfg.get("chunk_size", 600),
+        "chunk_overlap": cfg.get("chunk_overlap", 80),
+        "react_max_steps": cfg.get("react_max_steps", 4),
+        "fallback_to_normal_chat": cfg.get("fallback_to_normal_chat", True),
+    }
+
+
+def contains_keyword(text, keywords):
+    if not text:
+        return False
+    for kw in keywords or []:
+        if kw and kw in text:
+            return True
+    return False
+
+
+def ensure_xinsong_components():
+    global xinsong_rag_engine, xinsong_react_agent
+    cfg = get_xinsong_rag_config()
+
+    if xinsong_rag_engine is None:
+        xinsong_rag_engine = XinsongRAG(
+            kb_path=cfg["kb_path"],
+            chunk_size=cfg["chunk_size"],
+            chunk_overlap=cfg["chunk_overlap"],
+        )
+
+    if xinsong_react_agent is None:
+        openai_api_base, openai_api_key = resolve_openai_credentials()
+        xinsong_react_agent = XinsongReactAgent(
+            model_name=config.get("chatgpt", "model") or "qwen-plus",
+            api_key=openai_api_key,
+            api_base=openai_api_base,
+        )
+
+
+async def send_text_and_cosyvoice(client_id, text, client_type="text"):
+    output_text = (text or "").strip()
+    if not output_text:
+        return False
+
+    voice_tmp_path = aliyun_cosyvoice_api(output_text)
+    data = {
+        "type": "aliyun_cosyvoice",
+        "content": output_text,
+    }
+
+    if voice_tmp_path is not None:
+        my_logger.info(f"【TTS】音频合成完毕，输出在：{voice_tmp_path}")
+        await send_to_client(
+            client_id,
+            json.dumps({
+                'type': 'fullSentence',
+                'text': data["content"]
+            }),
+            client_type
+        )
+        await send_audio_to_client(client_id, voice_tmp_path)
+        return True
+
+    await send_to_client(
+        client_id,
+        json.dumps({
+            'type': 'fullSentence',
+            'text': data["content"]
+        }),
+        client_type
+    )
+    return False
+
+
+async def handle_xinsong_query(client_id, prompt, client_type="text"):
+    cfg = get_xinsong_rag_config()
+    if not cfg["enable"]:
+        return False
+
+    if not contains_keyword(prompt, cfg["trigger_keywords"]):
+        return False
+
+    try:
+        ensure_xinsong_components()
+        retrievals = xinsong_rag_engine.retrieve(prompt, top_k=cfg["top_k"])
+        react_result = await xinsong_react_agent.run(prompt, retrievals)
+
+        final_answer = (react_result.get("final_answer") or "").strip()
+        evidence = react_result.get("evidence") or []
+        intent = react_result.get("intent") or "新松问答"
+
+        if not final_answer:
+            final_answer = "我没有在当前新松知识库中找到足够信息，请换个问题试试。"
+
+        short_evidence = []
+        for ev in evidence[:2]:
+            ev_text = str(ev).replace("\n", " ").strip()
+            if len(ev_text) > 70:
+                ev_text = ev_text[:70] + "..."
+            if ev_text:
+                short_evidence.append(ev_text)
+
+        tts_text = final_answer
+        if short_evidence:
+            tts_text = f"{final_answer}。依据：{'；'.join(short_evidence)}"
+
+        my_logger.info(f"【新松RAG】intent={intent}, retrieval_count={len(retrievals)}")
+        await send_text_and_cosyvoice(client_id, tts_text, client_type=client_type)
+        return True
+    except Exception:
+        my_logger.error(traceback.format_exc())
+        return False
 
 
 def clean_asr_text(text, max_len=160):
@@ -361,6 +497,16 @@ async def llm_and_tts(client_id, prompt, client_type="text"):
             my_logger.warning("ASR 文本为空，跳过 LLM 与 TTS")
             return None
 
+        xinsong_cfg = get_xinsong_rag_config()
+        if contains_keyword(prompt, xinsong_cfg["trigger_keywords"]):
+            handled = await handle_xinsong_query(client_id, prompt, client_type=client_type)
+            if handled:
+                my_logger.info("【新松RAG】任务完成")
+                return None
+            if not xinsong_cfg.get("fallback_to_normal_chat", True):
+                my_logger.warning("【新松RAG】处理失败，且已关闭回退普通对话")
+                return None
+
         system_prompt = config.get("chatgpt", "preset") or "你是一个人工智能助手"
 
         async def tts_handle(tmp_content):
@@ -463,12 +609,7 @@ async def llm_and_tts(client_id, prompt, client_type="text"):
             import openai
             from packaging import version
 
-            openai_api_base = config.get("openai", "api")
-            openai_api_key = config.get("openai", "api_key")
-            if isinstance(openai_api_key, list):
-                openai_api_key = openai_api_key[0] if openai_api_key else ""
-            if not openai_api_key or openai_api_key == "sk-":
-                openai_api_key = load_bailian_api_key()
+            openai_api_base, openai_api_key = resolve_openai_credentials()
 
             # 判断openai库版本，1.x.x和0.x.x有破坏性更新
             if version.parse(openai.__version__) < version.parse('1.0.0'):

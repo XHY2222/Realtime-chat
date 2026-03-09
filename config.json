@@ -45,15 +45,15 @@
     "max_len": 9999,
     "max_char_len": 9999
   },
-  "chat_type": "zhipu",
+  "chat_type": "chatgpt",
   "openai": {
-    "api": "https://api.openai.com/v1",
+    "api": "https://dashscope.aliyuncs.com/compatible-mode/v1",
     "api_key": [
-      "sk-"
+      ""
     ]
   },
   "chatgpt": {
-    "model": "gpt-3.5-turbo",
+    "model": "qwen-plus",
     "temperature": 0.9,
     "max_tokens": 4096,
     "top_p": 1.0,
@@ -61,6 +61,18 @@
     "frequency_penalty": 0.0,
     "preset": "你是一个人工智能助手",
     "prompt_template": "当前中国北京日期：{current_date}，根据以下数据进行总结并提供答案。如果问题与数据不相关，使用你的常规知识回答，不可以胡编乱造！。\n参考数据：{summary_content}\n问题：{recorder_content}"
+  },
+  "xinsong_rag": {
+    "enable": true,
+    "trigger_keywords": [
+      "新松"
+    ],
+    "kb_path": "data/新松机器人Agent语料库.md",
+    "top_k": 4,
+    "chunk_size": 600,
+    "chunk_overlap": 80,
+    "react_max_steps": 4,
+    "fallback_to_normal_chat": true
   },
   "zhipu": {
     "api_key": "a03d9e9ba20bdd8ba1ecc13a06a27834.zPGhDMnCZQpL6DZq",
@@ -77,7 +89,7 @@
     "username": "陆星辰",
     "remove_useless": false
   },
-  "audio_synthesis_type": "edge-tts",
+  "audio_synthesis_type": "aliyun_cosyvoice",
   "audio_random_speed": {
     "normal": {
       "enable": false,
@@ -148,6 +160,12 @@
     "voice": "zh-CN-XiaoyiNeural",
     "rate": "+0%",
     "volume": "+0%"
+  },
+  "aliyun_cosyvoice": {
+    "api_ip_port": "https://dashscope.aliyuncs.com/compatible-mode/v1/audio/speech",
+    "model": "cosyvoice-v1",
+    "voice": "longxiaochun",
+    "format": "mp3"
   },
   "elevenlabs": {
     "api_key": "",
