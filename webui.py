@@ -3,7 +3,10 @@ import sys, os, json, subprocess, asyncio
 import logging, traceback
 # from functools import partial
 
-import pyautogui
+try:
+    import pyautogui
+except Exception:
+    pyautogui = None
 
 from utils.config import Config
 from utils.common import Common
@@ -325,6 +328,11 @@ def goto_func_page():
     async def get_mouse_xy():
         sleep_time = 5
         await asyncio.sleep(sleep_time)
+
+        if pyautogui is None:
+            logging.error("pyautogui 不可用，当前环境可能没有图形界面 (DISPLAY)")
+            ui.notify(position="top", type="warning", message="当前环境无图形界面，无法获取鼠标坐标")
+            return
         
         # 获取鼠标当前的 x 和 y 坐标
         x, y = pyautogui.position()

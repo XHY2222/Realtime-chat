@@ -3,9 +3,10 @@ import asyncio, aiohttp
 import websockets
 import threading
 import numpy as np
+import torch
 from scipy.signal import resample
 import json
-import sys, os, logging, traceback, base64
+import sys, os, logging, traceback, base64, re
 import requests
 from collections import defaultdict
 from zhipuai import ZhipuAI
@@ -81,6 +82,90 @@ search_online = SEARCH_ONLINE()
 audio_player =  AUDIO_PLAYER(config.get("audio_player"))
 
 
+def load_bailian_api_key(key_file="/root/apikey.txt"):
+    try:
+        with open(key_file, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception:
+        return ""
+
+
+def clean_asr_text(text, max_len=160):
+    if text is None:
+        return ""
+    text = str(text).strip()
+    if not text:
+        return ""
+
+    text = re.sub(r"(好嘞){3,}", "好嘞", text)
+    text = re.sub(r"(您好[?？]){3,}", "您好？", text)
+    text = re.sub(r"([哈啊嗯哦])\\1{4,}", r"\\1", text)
+    text = re.sub(r"(.{1,6}[?？!！。,.，])(?:\\1){2,}", r"\\1", text)
+
+    if len(text) > max_len:
+        match = re.search(r"[。！？.!?]", text[:max_len])
+        if match:
+            text = text[:match.end()]
+        else:
+            text = text[:max_len]
+
+    return text.strip()
+
+
+def aliyun_cosyvoice_api(text):
+    """Call Aliyun Bailian CosyVoice TTS and save audio file."""
+    api_key = load_bailian_api_key()
+    if not api_key:
+        my_logger.error("阿里云百炼 API Key 为空，请检查 /root/apikey.txt")
+        return None
+
+    cosy_cfg = config.get("aliyun_cosyvoice") or {}
+    model = cosy_cfg.get("model", "cosyvoice-v1")
+    voice = cosy_cfg.get("voice", "longxiaochun")
+    audio_format = cosy_cfg.get("format", "mp3")
+
+    try:
+        import dashscope
+        from dashscope.audio.tts_v2.speech_synthesizer import SpeechSynthesizer, AudioFormat
+
+        format_map = {
+            "mp3": AudioFormat.MP3_22050HZ_MONO_256KBPS,
+            "wav": AudioFormat.WAV_22050HZ_MONO_16BIT,
+            "pcm": AudioFormat.PCM_16000HZ_MONO_16BIT,
+        }
+        audio_fmt = format_map.get(str(audio_format).lower(), AudioFormat.MP3_22050HZ_MONO_256KBPS)
+
+        # AutoDL 代理会导致 CosyVoice websocket 握手失败，这里临时禁用代理
+        proxy_keys = ["http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "all_proxy"]
+        old_proxy_env = {k: os.environ.get(k) for k in proxy_keys}
+        for k in proxy_keys:
+            os.environ.pop(k, None)
+
+        try:
+            dashscope.api_key = api_key
+            synthesizer = SpeechSynthesizer(model=model, voice=voice, format=audio_fmt)
+            audio_bytes = synthesizer.call(text)
+        finally:
+            for k, v in old_proxy_env.items():
+                if v is not None:
+                    os.environ[k] = v
+
+        if not audio_bytes:
+            my_logger.error("CosyVoice 合成失败：返回空音频")
+            return None
+
+        file_name = 'aliyun_cosyvoice_' + common.get_bj_time(4) + f'.{audio_format}'
+        voice_tmp_path = common.get_new_audio_path(config.get("play_audio", "out_path"), file_name)
+        with open(voice_tmp_path, 'wb') as f:
+            f.write(audio_bytes)
+
+        return voice_tmp_path
+    except Exception as e:
+        my_logger.error(traceback.format_exc())
+        my_logger.error(f"CosyVoice TTS 异常: {e}")
+        return None
+
+
 
 # 存储录音的内容
 recorder_content = ""
@@ -100,6 +185,17 @@ audio_clients = {}
 client_threads = {}
 
 my_clients = []
+
+
+def resolve_whisper_model_path():
+    local_model_candidates = [
+        "/root/autodl-tmp/models/whisper-large-v3",
+        config.get("talk", "faster_whisper", "model_size"),
+    ]
+    for candidate in local_model_candidates:
+        if isinstance(candidate, str) and candidate and os.path.exists(candidate):
+            return candidate
+    return "large-v2"
 
 def generate_unique_client_id():
     import uuid
@@ -260,6 +356,13 @@ async def gpt_sovits_api(data):
 
 async def llm_and_tts(client_id, prompt, client_type="text"):
     try:
+        prompt = clean_asr_text(prompt, max_len=220)
+        if not prompt:
+            my_logger.warning("ASR 文本为空，跳过 LLM 与 TTS")
+            return None
+
+        system_prompt = config.get("chatgpt", "preset") or "你是一个人工智能助手"
+
         async def tts_handle(tmp_content):
             if contains_chinese_punctuation(tmp_content):
                 my_logger.info(f"【LLM】：{tmp_content}")
@@ -291,6 +394,12 @@ async def llm_and_tts(client_id, prompt, client_type="text"):
                         "content": tmp_content
                     }
                     voice_tmp_path = await edge_tts_api(data)
+                elif config.get("audio_synthesis_type") == "aliyun_cosyvoice":
+                    data = {
+                        "type": config.get("audio_synthesis_type"),
+                        "content": tmp_content
+                    }
+                    voice_tmp_path = aliyun_cosyvoice_api(tmp_content)
 
                 if voice_tmp_path is not None:
                     my_logger.info(f"【TTS】音频合成完毕，输出在：{voice_tmp_path}")
@@ -354,15 +463,22 @@ async def llm_and_tts(client_id, prompt, client_type="text"):
             import openai
             from packaging import version
 
+            openai_api_base = config.get("openai", "api")
+            openai_api_key = config.get("openai", "api_key")
+            if isinstance(openai_api_key, list):
+                openai_api_key = openai_api_key[0] if openai_api_key else ""
+            if not openai_api_key or openai_api_key == "sk-":
+                openai_api_key = load_bailian_api_key()
+
             # 判断openai库版本，1.x.x和0.x.x有破坏性更新
             if version.parse(openai.__version__) < version.parse('1.0.0'):
-                openai.api_base = config.get("openai", "api")
-                openai.api_key = config.get("openai", "api_key")[0]
+                openai.api_base = openai_api_base
+                openai.api_key = openai_api_key
 
                 response = openai.ChatCompletion.create(
                     model=config.get("chatgpt", "model"),
                     messages=[
-                        {"role": "system", "content": config.get("zhipu", "preset")},
+                        {"role": "system", "content": system_prompt},
                         {"role": "user", "content": prompt},
                     ],
                     top_p=config.get("chatgpt", "top_p"),
@@ -372,36 +488,34 @@ async def llm_and_tts(client_id, prompt, client_type="text"):
                     stream=True,
                 )
             else:
-                my_logger.debug(f"base_url={openai.api_base}, api_key={openai.api_key}")
+                my_logger.debug(f"base_url={openai_api_base}, api_key={'***' if openai_api_key else ''}")
 
-                client = openai.OpenAI(base_url=openai.api_base, api_key=openai.api_key)
+                client = openai.OpenAI(base_url=openai_api_base, api_key=openai_api_key)
 
-                # 调用 ChatGPT 接口生成回复消息
+                # 调用 OpenAI 兼容接口（阿里云 DashScope）生成回复消息
                 response = client.chat.completions.create(
                     model=config.get("chatgpt", "model"),
                     messages=[
-                        {"role": "system", "content": config.get("zhipu", "preset")},
+                        {"role": "system", "content": system_prompt},
                         {"role": "user", "content": prompt},
                     ],
                     top_p=config.get("chatgpt", "top_p"),
                     temperature=config.get("chatgpt", "temperature"),
                     presence_penalty=config.get("chatgpt", "presence_penalty"),
                     frequency_penalty=config.get("chatgpt", "frequency_penalty"),
-                    stream=True,
+                    stream=False,
                 )
 
-
-            for chunk in response:
-                tmp_content += chunk.choices[0].delta.content
+            if hasattr(response, "choices"):
+                first_choice = response.choices[0] if response.choices else None
+                if first_choice is not None:
+                    msg = getattr(first_choice, "message", None)
+                    if msg is not None:
+                        tmp_content = msg.content or ""
                 ret = await tts_handle(tmp_content)
                 if ret:
-                    # 清空文本
-                    tmp_content = ""
-
-                # my_logger.info(chunk)
-                if chunk.choices[0].finish_reason == "stop":
                     my_logger.info("任务完成")
-                    return None
+                return None
     except Exception as e:
         my_logger.error(traceback.format_exc())
         return None
@@ -706,8 +820,10 @@ if __name__ == '__main__':
         recorder_config = {
             'spinner': False,
             'use_microphone': False,
-            'model': 'large-v2',
+            'model': resolve_whisper_model_path(),
             'language': 'zh',
+            'compute_type': 'float16' if torch.cuda.is_available() else 'int8',
+            'gpu_device_index': 0,
             'silero_sensitivity': 0.4,
             'webrtc_sensitivity': 2,
             'post_speech_silence_duration': 0.7,
@@ -720,7 +836,7 @@ if __name__ == '__main__':
             'enable_realtime_transcription': True,
             # 指定音频块转录后的时间间隔（以秒为单位）。较低的值将导致更“实时”（频繁）的转录更新，但可能会增加计算负载
             'realtime_processing_pause': 0,
-            'realtime_model_type': 'tiny',
+            'realtime_model_type': resolve_whisper_model_path(),
             # 一个回调函数，每当实时听录中有更新时就会触发，并返回更高质量、稳定的文本作为其参数。
             # 'on_realtime_transcription_stabilized': text_detected,
             # 音频在正式录制之前缓冲的时间跨度（以秒为单位）。这有助于抵消语音活动检测中固有的延迟，确保不会遗漏任何初始音频

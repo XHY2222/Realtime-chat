@@ -66,6 +66,69 @@ BUFFER_SIZE = 512
 INT16_MAX_ABS_VALUE = 32768.0
 
 
+def _is_transformers_whisper_dir(model_size_or_path: str) -> bool:
+    if not isinstance(model_size_or_path, str):
+        return False
+    if not os.path.isdir(model_size_or_path):
+        return False
+    config_path = os.path.join(model_size_or_path, "config.json")
+    if not os.path.exists(config_path):
+        return False
+    marker_files = [
+        "pytorch_model.bin",
+        "model.safetensors",
+        "model.safetensors.index.json",
+        "pytorch_model.bin.index.json",
+        "model.fp32-00001-of-00002.safetensors",
+        "pytorch_model.fp32-00001-of-00002.bin",
+    ]
+    return any(os.path.exists(os.path.join(model_size_or_path, name)) for name in marker_files)
+
+
+def _build_transformers_asr(model_size_or_path: str, gpu_device_index=0):
+    from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
+
+    if isinstance(gpu_device_index, list):
+        gpu_device_index = gpu_device_index[0] if gpu_device_index else 0
+
+    use_cuda = torch.cuda.is_available()
+    if use_cuda:
+        device = f"cuda:{gpu_device_index}"
+        pipeline_device = int(gpu_device_index)
+        torch_dtype = torch.float16
+    else:
+        device = "cpu"
+        pipeline_device = -1
+        torch_dtype = torch.float32
+
+    model = AutoModelForSpeechSeq2Seq.from_pretrained(
+        model_size_or_path,
+        torch_dtype=torch_dtype,
+        low_cpu_mem_usage=True,
+        use_safetensors=True,
+    )
+    model.to(device)
+    processor = AutoProcessor.from_pretrained(model_size_or_path)
+
+    return pipeline(
+        "automatic-speech-recognition",
+        model=model,
+        tokenizer=processor.tokenizer,
+        feature_extractor=processor.feature_extractor,
+        torch_dtype=torch_dtype,
+        device=pipeline_device,
+        ignore_warning=True,
+    )
+
+
+def _ensure_spawn_start_method_for_gpu():
+    if not torch.cuda.is_available():
+        return
+    current = mp.get_start_method(allow_none=True)
+    if current != "spawn":
+        mp.set_start_method("spawn", force=True)
+
+
 class AudioToTextRecorder:
     """
     A class responsible for capturing audio from the microphone, detecting
@@ -252,6 +315,8 @@ class AudioToTextRecorder:
             model, wake word detection, or audio recording.
         """
 
+        _ensure_spawn_start_method_for_gpu()
+
         self.language = language
         self.compute_type = compute_type
         self.input_device_index = input_device_index
@@ -281,6 +346,8 @@ class AudioToTextRecorder:
         self.on_transcription_start = on_transcription_start
         self.enable_realtime_transcription = enable_realtime_transcription
         self.realtime_model_type = realtime_model_type
+        self.realtime_asr_backend = "faster_whisper"
+        self.realtime_transformers_asr = None
         self.realtime_processing_pause = realtime_processing_pause
         self.on_realtime_transcription_update = (
             on_realtime_transcription_update
@@ -402,12 +469,20 @@ class AudioToTextRecorder:
                     logging.info("Using CPU for faster_whisper realtime "
                                  "transcription model")
 
-                self.realtime_model_type = faster_whisper.WhisperModel(
-                    model_size_or_path=self.realtime_model_type,
-                    device='cuda' if torch.cuda.is_available() else 'cpu',
-                    compute_type=self.compute_type,
-                    device_index=self.gpu_device_index
-                )
+                if _is_transformers_whisper_dir(self.realtime_model_type):
+                    self.realtime_asr_backend = "transformers"
+                    self.realtime_transformers_asr = _build_transformers_asr(
+                        self.realtime_model_type,
+                        self.gpu_device_index,
+                    )
+                else:
+                    self.realtime_asr_backend = "faster_whisper"
+                    self.realtime_model_type = faster_whisper.WhisperModel(
+                        model_size_or_path=self.realtime_model_type,
+                        device='cuda' if torch.cuda.is_available() else 'cpu',
+                        compute_type=self.compute_type,
+                        device_index=self.gpu_device_index
+                    )
 
             except Exception as e:
                 logging.exception("Error initializing faster_whisper "
@@ -563,12 +638,16 @@ class AudioToTextRecorder:
                             "transcription model")
             
         try:
-            model = faster_whisper.WhisperModel(
-                model_size_or_path=model_path,
-                device='cuda' if torch.cuda.is_available() else 'cpu',
-                compute_type=compute_type,
-                device_index=gpu_device_index
-            )
+            use_transformers = _is_transformers_whisper_dir(model_path)
+            if use_transformers:
+                model = _build_transformers_asr(model_path, gpu_device_index)
+            else:
+                model = faster_whisper.WhisperModel(
+                    model_size_or_path=model_path,
+                    device='cuda' if torch.cuda.is_available() else 'cpu',
+                    compute_type=compute_type,
+                    device_index=gpu_device_index
+                )
 
         except Exception as e:
             logging.exception("Error initializing main "
@@ -587,16 +666,27 @@ class AudioToTextRecorder:
                 if conn.poll(0.5):
                     audio, language = conn.recv()
                     try:
-                        segments = model.transcribe(
-                            audio, language=language if language else None
-                        )
-                        segments = segments[0]
-                        transcription = " ".join(seg.text for seg in segments)
-                        transcription = transcription.strip()
+                        if use_transformers:
+                            generate_kwargs = {"task": "transcribe"}
+                            if language:
+                                generate_kwargs["language"] = language
+                            result = model(
+                                {"array": audio, "sampling_rate": SAMPLE_RATE},
+                                chunk_length_s=30,
+                                stride_length_s=5,
+                                ignore_warning=True,
+                                return_timestamps=False,
+                                generate_kwargs=generate_kwargs,
+                            )
+                            transcription = result.get("text", "").strip()
+                        else:
+                            segments = model.transcribe(
+                                audio, language=language if language else None
+                            )
+                            segments = segments[0]
+                            transcription = " ".join(seg.text for seg in segments)
+                            transcription = transcription.strip()
                         conn.send(('success', transcription))
-                    except faster_whisper.WhisperError as e:
-                        logging.error(f"Whisper transcription error: {e}")
-                        conn.send(('error', str(e)))
                     except Exception as e:
                         logging.error(f"General transcription error: {e}")
                         conn.send(('error', str(e)))
@@ -1206,10 +1296,25 @@ class AudioToTextRecorder:
                         INT16_MAX_ABS_VALUE
 
                     # Perform transcription and assemble the text
-                    segments = self.realtime_model_type.transcribe(
-                        audio_array,
-                        language=self.language if self.language else None
-                    )
+                    if self.realtime_asr_backend == "transformers":
+                        generate_kwargs = {"task": "transcribe"}
+                        if self.language:
+                            generate_kwargs["language"] = self.language
+                        result = self.realtime_transformers_asr(
+                            {"array": audio_array, "sampling_rate": SAMPLE_RATE},
+                            chunk_length_s=10,
+                            stride_length_s=2,
+                            ignore_warning=True,
+                            return_timestamps=False,
+                            generate_kwargs=generate_kwargs,
+                        )
+                        realtime_text = result.get("text", "").strip()
+                    else:
+                        segments = self.realtime_model_type.transcribe(
+                            audio_array,
+                            language=self.language if self.language else None
+                        )
+                        realtime_text = " ".join(seg.text for seg in segments[0]).strip()
 
                     # double check recording state
                     # because it could have changed mid-transcription
@@ -1217,11 +1322,7 @@ class AudioToTextRecorder:
                             self.recording_start_time > 0.5:
 
                         logging.debug('Starting realtime transcription')
-                        self.realtime_transcription_text = " ".join(
-                            seg.text for seg in segments[0]
-                        )
-                        self.realtime_transcription_text = \
-                            self.realtime_transcription_text.strip()
+                        self.realtime_transcription_text = realtime_text
 
                         self.text_storage.append(
                             self.realtime_transcription_text
